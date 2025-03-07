@@ -168,10 +168,16 @@
                 <i class="far fa-calendar"></i>
               </span>
               <span class="post-meta-item-text">Posted on</span>
-              
 
-              <time title="Created: 2025-03-05 15:34:03 / Modified: 15:37:13" itemprop="dateCreated datePublished" datetime="2025-03-05T15:34:03+08:00">2025-03-05</time>
+              <time title="Created: 2025-03-05 15:34:03" itemprop="dateCreated datePublished" datetime="2025-03-05T15:34:03+08:00">2025-03-05</time>
             </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">Edited on</span>
+                <time title="Modified: 2025-03-07 14:15:13" itemprop="dateModified" datetime="2025-03-07T14:15:13+08:00">2025-03-07</time>
+              </span>
 
           
 
@@ -185,8 +191,190 @@
 
       
           <h1 id="【翻译】CUTLASS-教程（1）：用-WGMMA-在-Hopper-架构上实现高效矩阵乘法"><a href="#【翻译】CUTLASS-教程（1）：用-WGMMA-在-Hopper-架构上实现高效矩阵乘法" class="headerlink" title="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法"></a>【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法</h1><blockquote>
-<p>写在前面：本文翻译自（<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/%EF%BC%89">https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/）</a></p>
+<p>写在前面：本文翻译自（<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/%EF%BC%89%EF%BC%8C%E6%9C%89%E4%BA%9B%E5%86%85%E5%AE%B9%E6%AF%94%E8%BE%83%E5%A4%8D%E6%9D%82%E6%B2%A1%E6%9C%89%E7%BF%BB%E8%AF%91%E5%A5%BD%E8%BF%98%E8%AF%B7%E8%A7%81%E8%B0%85%E3%80%82">https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/），有些内容比较复杂没有翻译好还请见谅。</a></p>
 </blockquote>
+<p>一个完整的 CUDA 教程系列无法绕过 GEMM（GEneral Matrix Multiplication，通用矩阵乘法）。GEMM 或许是现代 GPU 上最重要的程序了，因为它是神经网络、大语言模型、许多图形应用中的主要计算内容。尽管 GEMM 无处不在，然而众所周知实现一个高效的 GEMM 是很困难的。</p>
+<p>这个教程三部曲旨在为读者建立一个关于“如何在 Hopper 架构的 GPU 上使用 CUTLASS 写出高效的 GEMM”的大致概念。</p>
+<ul>
+<li>【Part 1，当前这个】讨论 warpgroup matrix-multiply-accumulate（WGMMA）指令，这类指令是在 Hopper 架构的 GPU 上操纵 Tensor Core 的主要指令。</li>
+<li>【Part 2】将讨论一个高效 GEMM kernel 的总体设计，还包括一些 CUTLASS 中用到的高级技术，比如 warp-specialization，ping-pong scheduling。</li>
+<li>【Part 3】将讨论 persistent kernel 和 Stream-K，这是一个在众多 problem size 上都达到 sota 性能的负载均衡策略。</li>
+</ul>
+<p><strong>总述：</strong>这三部系列教程大致契合一个 GEMM kernel 的开发过程，只不过是“自底向上”的。第一步，我们有一个原语（WGMMA），它通过调用 Tensor Core 一次完成一个 tile 的计算。第二步，我们在 CTA（等价 CUDA 中 block 的概念）的维度去设计一个 GEMM kernel，包括 prologue，mainloop，epilogue。其中的主要难点在于 Tensor Core 计算很快，要避免访存成为瓶颈。第三步，我们在 grid 层面对 CTAs 进行调度，这个环节关注的是 SM 的负载均衡。</p>
+<p>我们希望通过这个系列教程，读者能够成为 GEMM 算法的专家，并且把自己的想法融入的到他们工作中的 GEMM 的设计和实现。</p>
+<h2 id="Asynchronous-Warpgroup-MMA（WGMMA）"><a href="#Asynchronous-Warpgroup-MMA（WGMMA）" class="headerlink" title="Asynchronous Warpgroup MMA（WGMMA）"></a>Asynchronous Warpgroup MMA（WGMMA）</h2><p>Hopper 架构引入了异步的、Warpgroup-Level 的矩阵乘加操作（WGMMA）。一个 warpgroup 包含 4 个连续的 warp，即 128 个连续的 thread，并且要求第一个 warp 的编号是 4 的倍数。wgmma.mma_async 指令由一个 warpgroup 中的 128 个线程协同执行。一个 mma 操作通常是以下两种形式之一，区别在于是否把 C 矩阵作为累加器：</p>
+<ul>
+<li>C &#x3D; A x B + C</li>
+<li>C &#x3D; A x B（输入中的累加数 C 被忽略）</li>
+</ul>
+<p>这里还有一个值得注意的约束，WGMMA 中的输入矩阵 B 必须存放在 shared memory（SMEM）中，输入矩阵 A 则是既可以在 SMEM 中也可以在 register memory（RMEM）中，累加矩阵 C 则是必须存放在 RMEM 中。</p>
+<p>本篇 blog 接下来的内容大概有：一，讨论如何在 CUTLASS 中调用 wgmma.mma_async，这个过程涉及到构造相应的 TiledMMA 对象，创建并划分与 WGMMA 适配的 SMEM Tensor。二，讨论正确使用 WGMMA 涉及到的必要的同步机制；三，讨论一些 WGMMA 关联的 Layout 的细节，包括 SMEM 中与输入 A、B 矩阵相关的 core matrices 和 matrix descriptor 的细节。</p>
+<p>下文将 wgmma.mma_async 简写为 wgmma。本文主要参考的代码来自<a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/blob/be60a0b27204078dc0f3f1d6ed4a95cdb2114111/examples/cute/tutorial/wgmma_sm90.cu">wgmma tutorial</a>。</p>
+<h2 id="一个-CUTLASS-kernel-中的-WGMMA"><a href="#一个-CUTLASS-kernel-中的-WGMMA" class="headerlink" title="一个 CUTLASS kernel 中的 WGMMA"></a>一个 CUTLASS kernel 中的 WGMMA</h2><p>本文旨在解释如何使用 wgmma 原语调用 Hopper 的 Tensor Core 去做 tiled-GEMM，以及如何让 wgmma 被 cute::gemm() 函数所使用。先简单说下背景，考虑一个 MxNxK 的矩阵乘法问题，其中输入矩阵 A 的形状是 MxK，输入矩阵 B 的形状是 KxN，要计算得到的矩阵 C &#x3D; AxB 形状是 MxN。为了将计算过程并行化，我们固定每一个 CTA 负责计算 C 矩阵中的一个形状为 bMxbN 的 tile，这样就需要 $\lceil \frac{M}{bM} \rceil \times \lceil \frac{N}{bN} \rceil$ 个 CTA。bMxbN 的 tile 计算完成后存放在 CTA 的 RMEM 中，随后被写入 global memory（GMEM）中的 C 矩阵。</p>
+<p>接下来介绍 mainloop 的概念，mainloop 是 kernel 的一段核心逻辑，在其中会完成输入数据（A，B矩阵）的加载，以及 C 矩阵的计算。这里简单提一下，每一个 CTA 会接受三个参数 bM, bN, bK，其中 bM, bN 的概念上一段已经介绍，接下来介绍 bK 在 mainloop 中的意义。mainloop 中会进行 $\lceil \frac{K}{bK} \rceil$ 次迭代，每次迭代会加载 A 矩阵中一个大小为 bMxbK 的 tile，和 B 矩阵中一个大小为 bNxbK 的 tile，这里的加载指的是将数据从 GMEM 搬到 SMEM，下面 sA 和 sB 分别来表示 SMEM 中 A 矩阵、B矩阵的一个 tile。B 矩阵中取出来的 tile 的是 bNxbK 而不是 bKxbN 的原因是 CUTLASS 中习惯将 sA 看作是 bMxbK，将 sB 看作是 bNxbK（注意，这只是一个习惯，并不影响数学上的计算意义）。cute::gemm() 函数将计算 sA 和 sB 的矩阵乘积结果 rC。mainloop 环节结束后是 epilogue 环节，在该环节中将把计算结果 rC 写回 GMEM。</p>
+<blockquote>
+<p>实际上 sA 的 shape 是 bMxbKxStages，sB 同理，后面会解释什么是 Stages。简单理解就是 SMEM 中最多可以同时存放 Stages 个 tile。</p>
+</blockquote>
+<p>现在，我们开始 cute::gemm() 以及它的参数，如下代码是从 <a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/blob/be60a0b27204078dc0f3f1d6ed4a95cdb2114111/examples/cute/tutorial/wgmma_sm90.cu">wgmma tutorial</a> 中截取的，但省略了一些无关的部分。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">template</span> &lt;<span class="keyword">class</span> <span class="title class_">TiledMMA</span>, ... &gt;</span><br><span class="line"><span class="function">__global__ <span class="title">device_gemm</span><span class="params">(TiledMMA tiled_mma, ...)</span> </span>&#123;</span><br><span class="line">  <span class="comment">// PROLOGUE</span></span><br><span class="line">  <span class="comment">// ...</span></span><br><span class="line">  <span class="comment">// Define A/B partitioning and C accumulators</span></span><br><span class="line">  ThrMMA thr_mma = tiled_mma.<span class="built_in">get_thread_slice</span>(threadIdx.x);</span><br><span class="line">  Tensor tCsA = thr_mma.<span class="built_in">partition_A</span>(sA);  <span class="comment">// (MMA,MMA_M,MMA_K,PIPE)</span></span><br><span class="line">  Tensor tCsB = thr_mma.<span class="built_in">partition_B</span>(sB);  <span class="comment">// (MMA,MMA_N,MMA_K,PIPE)</span></span><br><span class="line">  Tensor tCgC = thr_mma.<span class="built_in">partition_C</span>(gC);  <span class="comment">// (MMA,MMA_M,MMA_N)</span></span><br><span class="line"> </span><br><span class="line">  <span class="comment">// Allocate accumulators and clear them</span></span><br><span class="line">  Tensor tCrC = thr_mma.<span class="built_in">make_fragment_C</span>(tCgC);  <span class="comment">// (MMA,MMA_M,MMA_N)</span></span><br><span class="line">  <span class="built_in">clear</span>(tCrC);</span><br><span class="line"> </span><br><span class="line">  <span class="comment">// Allocate &quot;fragments&quot;</span></span><br><span class="line">  Tensor tCrA = thr_mma.<span class="built_in">make_fragment_A</span>(tCsA);  <span class="comment">// (MMA,MMA_M,MMA_K,PIPE)</span></span><br><span class="line">  Tensor tCrB = thr_mma.<span class="built_in">make_fragment_B</span>(tCsB);  <span class="comment">// (MMA,MMA_N,MMA_K,PIPE)</span></span><br><span class="line">   </span><br><span class="line">  <span class="comment">// PIPELINED MAIN LOOP</span></span><br><span class="line">  <span class="keyword">while</span> (k_tile_count &gt; -K_PIPE_MAX) &#123;</span><br><span class="line">    <span class="comment">// ...</span></span><br><span class="line">    <span class="comment">// MMAs to cover 1 K_TILE</span></span><br><span class="line">    cute::<span class="built_in">warpgroup_arrive</span>();</span><br><span class="line">    <span class="comment">// (V,M,K) x (V,N,K) =&gt; (V,M,N)</span></span><br><span class="line">    cute::<span class="built_in">gemm</span>(tiled_mma, <span class="built_in">tCrA</span>(_,_,_,read_pipe), <span class="built_in">tCrB</span>(_,_,_,read_pipe), tCrC);</span><br><span class="line">    cute::<span class="built_in">warpgroup_commit_batch</span>();</span><br><span class="line">    <span class="comment">// Wait for all MMAs in a K_TILE to complete</span></span><br><span class="line">    cute::<span class="built_in">warpgroup_wait</span>&lt;<span class="number">0</span>&gt;();</span><br><span class="line">    <span class="comment">// ...</span></span><br><span class="line">  &#125;</span><br><span class="line"> </span><br><span class="line">  <span class="comment">// EPILOGUE</span></span><br><span class="line">  <span class="comment">// ...</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>在 CUTLASS 中，通过 cute::gemm() 这样一个统一的接口来暴露特定架构的 MMA 指令，它接受两个输入 tensor 并计算矩阵乘加的结果。关于 cute::gemm() 的参数：</p>
+<ul>
+<li>TiledMMA 类型的对象 tiled_mma 的定义，会影响 cute::gemm() 选择具体的 wgmma ptx 指令。</li>
+<li>sA 和 sB 的 layout 必须与 wgmma 要求的格式适配。</li>
+<li>每一个线程都持有它计算的 tCrA, tCrB, tCrC，它们的 layout 是由 tiled_mma 决定的。</li>
+<li>此处的 tCrA（如果源操作数 A 来自 SMEM）和 tCrB 并非是把 sA. sB 从 SMEM 中把对应的数据拷贝过来，然后存放在寄存器中。它们只是一个构建在 SMEM 中的 matrix descriptor。</li>
+</ul>
+<p>注意到上边的代码中，cute::gemm() 周围有一些 warpgroup 同步原语，这部分稍后介绍。</p>
+<h2 id="关于-TiledMMA"><a href="#关于-TiledMMA" class="headerlink" title="关于 TiledMMA"></a>关于 TiledMMA</h2><p>接下来，假设数据类型是 FP16，A 和 B 都说 MN-major 的矩阵，（按照 BLAS 的记号）我们正在进行一个 NT GEMM。我们可以在 host 端构造这样一个 TiledMMA:</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">TiledMMA tiled_mma = cute::<span class="built_in">make_tiled_mma</span>(</span><br><span class="line">  SM90_64x64x16_F16F16F16_SS&lt;GMMA::Major::MN,GMMA::Major::MN&gt;&#123;&#125;);</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>NT 中的 N 指 Not Transpose，T 指的是 Transpose。Fortan 中默认矩阵是列主的，BLAS 沿用了这一设定，于是对于 A 来说 M-major 就是 N，对于 B 来说 N-major 就是 T（因为 B 是一个 KxN 的矩阵，默认列主是 K-major）。更详细的解释参考<a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/blob/main/media/docs/cute/0x_gemm_tutorial.md#aside-m-major-n-major-k-major">这里</a>。</p>
+</blockquote>
+<p>cute::make_tiled_mma 还有一些其他可选参数，不过这里我们暂时先关注 MMA Atom。这是一个 struct，内部封装了内联 PTX 指令，在上面的代码中对应的 PTX 指令是：</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">wgmma.mma_async.sync.aligned.m64n64k<span class="number">16.f16</span>.f<span class="number">16.f16</span></span><br></pre></td></tr></table></figure>
+
+<p>上面的 CUTLASS 记号可以很快对应到 PTX 指令和 MMA Atom。首先，SM90 就是 Hopper 架构的另一个名字。SM90 MMA Atom 的形式大致是 <code>SM90_MxNxK_XYZ_SS</code> 或者 <code>SM90_MxNxK_XYZ_RS</code>，它接受两个模板参数，每一个都可以是 <code>GMMA::Major::MN</code> 或 <code>GMMA::Major::K</code> 中的一个。其中符号的意义如下：</p>
+<ul>
+<li>X 和 Y 表示 oprands 的元素类型（即，A、B 矩阵）；</li>
+<li>Z 是 accumulator 的元素类型（即 C 矩阵）；</li>
+<li>MxNxK 是 wgmma 的 tile size，这个 MxNxK 可以被认为是一种 atom。不过，M，N，K 需要满足一些<a target="_blank" rel="noopener" href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-shape">约束</a>。M 必须是 64，N 可以是 8 到 256 之间的 8 的倍数，K 是 16。（更一般地来说，K 维度固定是 32 bytes）</li>
+<li>后缀 <code>RS</code> 和 <code>SS</code> 分别表示 A 和 B 在 RMEM 还是 SMEM。R 表示 RMEM，S 表示 SMEM。由于 B 必须存放在 SMEM，因此第二个字母总是 S。</li>
+<li>模板参数中的两个 major 分别表示 A 的 major 和 B 的 major。<strong>特别地，对于操作数元素类型不是 16bits 的情况，layout 必须都说 K-major。</strong></li>
+</ul>
+<p>至此讲完了 MMA Atom 的语法规则。我们此前说过 WGMMA 是一个 warpgroup-level（也就是需要一个 warpgroup 一起完成的）指令。在代码中，我们可以获取参与 mma 操作的线程数量，例如如下 host 端代码发射一个每个 CTA 有 128 threads 的 kernel。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line"><span class="function">dim3 <span class="title">dimBlock</span><span class="params">(cute::size(tiled_mma))</span></span>;</span><br></pre></td></tr></table></figure>
+
+<p>假设我们有 2 个 warpgroup 来执行 WGMMA，其中每个 warpgroup 分别计算输出 tile 的一半（每个 warpgroup 各自发射各自的 wgmma）。为此，我们可以传递一个 layout（AtomLayoutMNK）给 make_tiled_mma。例如，如下代码定义了一个 WGMMA 操作，其中 warpgroup1 和 warpgroup2 分别计算输出 tile 的上半部分和下半部分（对 M 维度做切分）。此时 <code>size(tiled_mma)</code> 应该等于 256。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line">TiledMMA tiled_mma = <span class="built_in">make_tiled_mma</span>(</span><br><span class="line">  SM90_64x64x16_F16F16F16_SS&#123;&#125;,</span><br><span class="line">  Layout&lt;Shape&lt;_2,_1,_1&gt;&gt;&#123;&#125;);</span><br></pre></td></tr></table></figure>
+
+<p>make_tiled_mma 的除了 MMA_Atom 外还有另外两个参数——AtomLayoutMNK 和 PermutationMNK。关于 PermutationMNK 的使用可以参考<a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/discussions/1345">这里</a>。</p>
+<h2 id="WGMMA-约束下的-SMEM-layout"><a href="#WGMMA-约束下的-SMEM-layout" class="headerlink" title="WGMMA 约束下的 SMEM layout"></a>WGMMA 约束下的 SMEM layout</h2><p>接下来我们解释在给定 MMA Atom 的情况下，输入矩阵在 SMEM 中的 tile size 和 layout 应该满足什么约束。首先，对于任意 MMA 指令，MMA Atom 的 MxNxK 需要能够把 bMxbNxbK 划分为若干个 operand 和 accumulator tile。也就是说在上面的例子中，bM 必须是 64 的倍数，bN 必须是 64 的倍数，bK 必须是 16 的倍数。</p>
+<p>其次，WGMMA 还会对 SMEM layout 有一个约束（对 shape 和 stride 都有约束），这个约束会随着 swizzle 的变化而变化。特别的，sA 的 layout 不是简单的 <code>(bM, bK) : (1, bM)</code> 或者 <code>(bM, bK) : (bK, 1)</code>。</p>
+<p>为了深入理解这个约束，我们接下来需要引入 core matrices 的概念。其实，实践中我们可以直接使用 CUTLASS 预定义的 layout atom 来包装 SMEM layout 与 wgmma 兼容，具体参考下面的代码。在我们的例子中，tile size、sA layout、sB layout 在 host 端完成计算。下边的 T 是 cutlass::half_t 类型，也就是 FP16。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">auto</span> bM = Int&lt;<span class="number">128</span>&gt;&#123;&#125;;</span><br><span class="line"><span class="keyword">auto</span> bN = Int&lt;<span class="number">128</span>&gt;&#123;&#125;;</span><br><span class="line"><span class="keyword">auto</span> bK = Int&lt; <span class="number">64</span>&gt;&#123;&#125;;  </span><br><span class="line"><span class="keyword">auto</span> bP = Int&lt;  <span class="number">3</span>&gt;&#123;&#125;;  <span class="comment">// Pipeline</span></span><br><span class="line"> </span><br><span class="line"><span class="keyword">auto</span> sA = cute::<span class="built_in">tile_to_shape</span>(</span><br><span class="line">    GMMA::Layout_MN_SW128_Atom&lt;T&gt;&#123;&#125;,</span><br><span class="line">    cute::<span class="built_in">make_shape</span>(bM, bK, bP)</span><br><span class="line">);</span><br><span class="line"><span class="keyword">auto</span> sB = cute::<span class="built_in">tile_to_shape</span>(</span><br><span class="line">    GMMA::Layout_MN_SW128_Atom&lt;T&gt;&#123;&#125;,</span><br><span class="line">    cute::<span class="built_in">make_shape</span>(bN, bK, bP)</span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+
+<blockquote>
+<p>注意，这里的 sA, sB 并不是一个 SMEM 中的 tensor，而是 layout。</p>
+</blockquote>
+<p>这里，MN 表示 MN-major，SW128 表示是 128bytes 的 swizzle 模式，打印 sA 和 sB 可以看到：</p>
+<figure class="highlight txt"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">Sw&lt;3,4,3&gt; o smem_ptr[16b](unset) o ((_64,_2),(_8,_8),_3):((_1,_512),(_64,_1024),_8192)</span><br></pre></td></tr></table></figure>
+
+<p>有人可能会好奇，这是怎么来的？cute::tile_to_shape 接受一个 layout (也可以说是一个 tile) 并且把它复制多份，以覆盖一个更大的 shape。关于 swizzle——Sw&lt;3,4,3&gt;，稍后再谈。先来看 layout atom——<code>(64,8):(1,64)</code>，可以看到它以列优先的方式覆盖了 shape <code>(128,64,3)</code>。</p>
+<blockquote>
+<p>熟悉 layout 的话应该可以很快看懂这个 layout，不熟悉的话一两句话讲不清楚。</p>
+</blockquote>
+<p>注意 FP16 是 2bytes，它的 64 倍是 128 bytes，这就是 swizzle 模式名字的来源（SW128）。它基于这样一个设计：由于 core matrices 的工作方式，我们必须确保 atom layout 连续的方向上的长度是等于 16 bytes，因此它必须是 16 bytes(no-swizzle)，32bytes，64bytes，128bytes 中的一种。</p>
+<p>相反，考虑 k-major 的情况：</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">auto</span> sA = cute::<span class="built_in">tile_to_shape</span>(</span><br><span class="line">  GMMA::Layout_K_SW128_Atom&lt;T&gt;&#123;&#125;,</span><br><span class="line">  cute::<span class="built_in">make_shape</span>(bM,bK,bP)</span><br><span class="line">);</span><br><span class="line"><span class="keyword">auto</span> sB = cute::<span class="built_in">tile_to_shape</span>(</span><br><span class="line">  GMMA::Layout_K_SW128_Atom&lt;T&gt;&#123;&#125;,</span><br><span class="line">  cute::<span class="built_in">make_shape</span>(bN,bK,bP)</span><br><span class="line">);</span><br></pre></td></tr></table></figure>
+
+<p>打印这里的 sA 和 sB 会得到：</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">Sw&lt;<span class="number">3</span>,<span class="number">4</span>,<span class="number">3</span>&gt; o smem_ptr[<span class="number">16</span>b](unset) <span class="built_in">o</span> (_128,_64,_3):(_64,_1,_8192)</span><br></pre></td></tr></table></figure>
+
+<p>这里我们要用 <code>(8,16):(75,1)</code> 这样的 tile 去覆盖 <code>(128,64,3)</code>。</p>
+<p>总的来说有 8 种可选的 <a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/blob/36cbfcf483cc9d2ee65a55c199176ce96da1e33e/include/cute/atom/mma_traits_sm90_gmma.hpp#L66">layout atoms</a>，major 可以选择 mn 或者 k，swizzle 可以从以下 4 种中选一种：</p>
+<ul>
+<li>No swizzle (16-byte swizzle)</li>
+<li>32-byte swizzle（对连续 2 个 16byte 的段进行 swizzle）</li>
+<li>64-byte swizzle（对连续 4 个 16byte 的段进行 swizzle）</li>
+<li>128-byte swizzle（对连续 8 个 16byte 的段进行 swizzle）</li>
+</ul>
+<blockquote>
+<p>这个小节可能会比较难懂，建议先熟悉 cutlass 的 layout 的概念和 swizzle 的概念。感觉这一部分我翻译的不是很好，可能我自己还停留在能看懂但讲不好的层面……</p>
+</blockquote>
+<h2 id="WGMMA-Fragments-and-Descriptors"><a href="#WGMMA-Fragments-and-Descriptors" class="headerlink" title="WGMMA Fragments and Descriptors"></a>WGMMA Fragments and Descriptors</h2><p>以上描述了在 host 端创建 TiledMma 的方法，以及创建 SMEM layout 的方法。接下来将描述如何利用 TiledMMA 类型的对象 tiled_mma 在 device 端构造相应的 tensor（这些 tensor 即传入 cute::gemm() 的参数）。首先要创建一个 ThrMMA 类型的对象 thr_mma，我们可以使用 <code>get_thread_slice(int thread_index)</code> 来获取 thr_mma。在我们的例子中吗，这个 thread_index 的范围是 0-127。</p>
+<p>按照以上代码，在某个线程中打印 tCsA 和 tCsB 都可以看到如下内容（tCsA 和 tCsB 分别是一个线程参与 wgmma 要用到的 operand）：</p>
+<blockquote>
+<p>不同线程拿到的 swizzle 和 layout 都是一样的，区别在于 smem_ptr 指向的地址不一样。</p>
+</blockquote>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">tCsA: Sw&lt;<span class="number">3</span>,<span class="number">4</span>,<span class="number">3</span>&gt;_smem_ptr[<span class="number">16</span>b](<span class="number">0x7f8800000400</span>) <span class="built_in">o</span></span><br><span class="line">    ((_64,(_8,_2)),_2,_4,_3):((_1,(_64,_1024)),_512,_2048,_8192)</span><br><span class="line">tCsB: Sw&lt;<span class="number">3</span>,<span class="number">4</span>,<span class="number">3</span>&gt;_smem_ptr[<span class="number">16</span>b](<span class="number">0x7f880000c400</span>) <span class="built_in">o</span></span><br><span class="line">    ((_64,(_8,_2)),_2,_4,_3):((_1,(_64,_1024)),_512,_2048,_8192)</span><br></pre></td></tr></table></figure>
+
+<p>此时，tCsA 的 layout 的格式是 <code>(MMA,MMA_M,MMA_K,PIPE)</code>：</p>
+<ul>
+<li><code>MMA</code> 是 MMA Atom 中的 <code>MxK</code> 的部分。</li>
+<li><code>MMA_M</code> 和 <code>MMA_K</code> 分别是 <code>MMA</code> 在 sA 的 M 方向上和 K 方向上重复的次数（即 MMA_M &#x3D; bM&#x2F;64，MMA_K&#x3D;bK&#x2F;16）。</li>
+<li><code>PIPE</code> 表示 Stages。</li>
+</ul>
+<p>tCsA 中的 stride 和 swizzle 从 sA 中继承过来。由于这里是 WGMMA，因此 tCsA 并不是一个 SMEM 中的 Tensor 分到某一个 thread 上的切片，而是整个 SMEM Tensor，只不过 layout 有所变化。</p>
+<p>接下来，打印 “fragments” tCrA 和 tCrB 可以看到：</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">tCrA: <span class="function">GMMA::DescriptorIterator <span class="title">o</span> <span class="params">(_1,_2,_4,_3)</span>:(_0,_64,_256,_1024)</span></span><br><span class="line"><span class="function">tCrB: GMMA::DescriptorIterator o (_1,_2,_4,_3):(_0,_64,_256,_1024)</span></span><br></pre></td></tr></table></figure>
+
+<p>CUTLASS 内部会构造一个 “matrix descriptor”，这是一个保存在 registers 中的 64bit 数据，它描述了 wgmma 指令用到的 SMEM 中的数据格式。再次强调这里 SMEM 中的数据并没有被拷贝到 RMEM，相反，访问 tCrA 和 tCrB 的时候实际上在访问相应的 matrix descriptor。另外，上面代码中的 Iterator 表明每次只有 24 个中的一个 decriptor 存放在寄存器中。</p>
+<p>与之相对的是，accumulate 的存储方式则是大家熟悉的方式，tCgC 在 GMEM，tCrC 在 RMEM，打印它们可以看到</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line">tCgC: gmem_ptr[<span class="number">16</span>b](<span class="number">0x7f877a780000</span>) <span class="built_in">o</span> ((_2,_2,_8),_2,_2):((<span class="number">512</span>,_8,<span class="number">4096</span>),_64,<span class="number">32768</span>)</span><br><span class="line">tCrC: ptr[<span class="number">16</span>b](<span class="number">0x7feee1fffbe0</span>) <span class="built_in">o</span> ((_2,_2,_8),_2,_2):((_1,_2,_4),_32,_64)</span><br></pre></td></tr></table></figure>
+
+<p>这里的 tCgC 是输出 GMEM tensor 在该线程中的切片，tCrC 则是计算结果，将要被写入 tCgC。tCrC 的 layout 具体有格式 <code>(MMA, MMA_M, MMA_N)</code>，可以认为是在 MxN&#x3D;64x64 的 MMA Atom 中，这 128 threads 中的每一个 thread 都持有 2x2x8&#x3D;32 个元素，这里的 MMA_M 和 MMA_N 分别于 tCsA 和 tCsB 中的值相等。</p>
+<p>每一个线程持有的一个 atom 中的 32 个元素，注意它的 shape 是要和 tCgC 是对上的。具体的划分是由具体的 wgmma 指令规定的，可以在下图检索具体的信息（来自<a target="_blank" rel="noopener" href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#wgmma-64n16-d">PTX文档</a>）：</p>
+<p><img src="/../images/ptx_inst.png" alt="alt text"></p>
+<p>上图阐明了一个线程拿着的 32 个元素呈现一个 Z 字形。例如，thread 0 拿着在 <code>(0,0),(0,1),(8,0),(8,1)</code> 这些元素，并且这样的 pattern 在列方向上重复了 8 次。</p>
+<h2 id="cute-gemm-调用"><a href="#cute-gemm-调用" class="headerlink" title="cute::gemm() 调用"></a>cute::gemm() 调用</h2><p>让我们回到 kernel 代码的第 25 行：</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// (V,M,K) x (V,N,K) =&gt; (V,M,N)</span></span><br><span class="line">cute::<span class="built_in">gemm</span>(tiled_mma, <span class="built_in">tCrA</span>(_,_,_,read_pipe), <span class="built_in">tCrB</span>(_,_,_,read_pipe), tCrC);</span><br></pre></td></tr></table></figure>
+
+<p><code>cute::gemm</code> 有着各种各样的重载，此处，它的内部在 MMA_M&#x2F;N 和 MMA_K loop 上进行了循环。我们首先来看 <code>cute::gemm</code> 关于 <a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/blob/be60a0b27204078dc0f3f1d6ed4a95cdb2114111/include/cute/algorithm/gemm.hpp#L178"><code>(V)x(V)=&gt;V</code></a> 的重载。</p>
+<p>如下代码将调用 MMA Atom 的 fma 运算，如下是对应的 PTX 指令：</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br></pre></td><td class="code"><pre><span class="line"><span class="function">CUTE_HOST_DEVICE <span class="type">static</span> <span class="type">void</span></span></span><br><span class="line"><span class="function">  <span class="title">fma</span><span class="params">(<span class="type">uint64_t</span> <span class="type">const</span>&amp; desc_a,</span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="type">uint64_t</span> <span class="type">const</span>&amp; desc_b,</span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="type">uint32_t</span>&amp; d00, <span class="type">uint32_t</span>&amp; d01, <span class="type">uint32_t</span>&amp; d02, <span class="type">uint32_t</span>&amp; d03,</span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="type">uint32_t</span>&amp; d04, <span class="type">uint32_t</span>&amp; d05, <span class="type">uint32_t</span>&amp; d06, <span class="type">uint32_t</span>&amp; d07,</span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="type">uint32_t</span>&amp; d08, <span class="type">uint32_t</span>&amp; d09, <span class="type">uint32_t</span>&amp; d10, <span class="type">uint32_t</span>&amp; d11,</span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="type">uint32_t</span>&amp; d12, <span class="type">uint32_t</span>&amp; d13, <span class="type">uint32_t</span>&amp; d14, <span class="type">uint32_t</span>&amp; d15,</span></span></span><br><span class="line"><span class="params"><span class="function">      GMMA::ScaleOut <span class="type">const</span> scale_D = GMMA::ScaleOut::One)</span></span></span><br><span class="line"><span class="function">  </span>&#123;</span><br><span class="line"><span class="meta">#<span class="keyword">if</span> defined(CUTE_ARCH_MMA_SM90A_ENABLED)</span></span><br><span class="line">    <span class="function"><span class="keyword">asm</span> <span class="title">volatile</span><span class="params">(</span></span></span><br><span class="line"><span class="params"><span class="function">    <span class="string">&quot;&#123;\n&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot;.reg .pred p;\n&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot;setp.ne.b32 p, %18, 0;\n&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot;wgmma.mma_async.sync.aligned.m64n64k16.f16.f16.f16 &quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot;&#123;%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  &quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot; %8,  %9,  %10, %11, %12, %13, %14, %15&#125;,&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot; %16,&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot; %17,&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      <span class="string">&quot; p,   %19, %20, %21, %22;\n&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">    <span class="string">&quot;&#125;\n&quot;</span></span></span></span><br><span class="line"><span class="params"><span class="function">      : <span class="string">&quot;+r&quot;</span>(d00), <span class="string">&quot;+r&quot;</span>(d01), <span class="string">&quot;+r&quot;</span>(d02), <span class="string">&quot;+r&quot;</span>(d03),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;+r&quot;</span>(d04), <span class="string">&quot;+r&quot;</span>(d05), <span class="string">&quot;+r&quot;</span>(d06), <span class="string">&quot;+r&quot;</span>(d07),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;+r&quot;</span>(d08), <span class="string">&quot;+r&quot;</span>(d09), <span class="string">&quot;+r&quot;</span>(d10), <span class="string">&quot;+r&quot;</span>(d11),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;+r&quot;</span>(d12), <span class="string">&quot;+r&quot;</span>(d13), <span class="string">&quot;+r&quot;</span>(d14), <span class="string">&quot;+r&quot;</span>(d15)</span></span></span><br><span class="line"><span class="params"><span class="function">      : <span class="string">&quot;l&quot;</span>(desc_a),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;l&quot;</span>(desc_b),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;r&quot;</span>(<span class="type">int32_t</span>(scale_D)),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;n&quot;</span>(<span class="type">int32_t</span>(scaleA)),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;n&quot;</span>(<span class="type">int32_t</span>(scaleB)),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;n&quot;</span>(<span class="type">int32_t</span>(tnspA)),</span></span></span><br><span class="line"><span class="params"><span class="function">        <span class="string">&quot;n&quot;</span>(<span class="type">int32_t</span>(tnspB)))</span></span>;</span><br><span class="line"><span class="meta">#<span class="keyword">else</span></span></span><br><span class="line">    <span class="built_in">CUTE_INVALID_CONTROL_PATH</span>(</span><br><span class="line">        <span class="string">&quot;Attempting to use SM90_64x64x16_F16F16F16_SS &quot;</span></span><br><span class="line">        <span class="string">&quot;without CUTE_ARCH_MMA_SM90A_ENABLED&quot;</span>);</span><br><span class="line"><span class="meta">#<span class="keyword">endif</span></span></span><br><span class="line">  &#125;</span><br></pre></td></tr></table></figure>
+
+<p><a target="_blank" rel="noopener" href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma">这里</a> 可以查看 PTX 的语法。可以观察到，我们有 uint64 类型的 desc_a 和 desc_b，它俩也会作为 ptx 指令的 operand，还有 16 个 uint32 元素作为 accumulator。（注意到每个线程持有 32 个 fp16，因此实际上两个 fp16 存放在一个 uint32 中）此处的 scale_D 变量的取值是 0&#x2F;1，0 表示是否 accumulator 要把上一次 accumulator 的结果清零，1 则是保留上一次 accumulator 的结果。</p>
+<p>另外，变量 scaleA, scaleB, tnspA, tnspB 是通过模板参数决定的（在 compile-time 就决定了）。scaleA 和 scaleB 的取值是 1 或 -1 分别表示要不要对 operand 取相反数，tnspA 和 tnspB 则表示要不要对 A 或 B 做转置，0&#x2F;1 取值分别对应 k-major 和 mn-major。</p>
+<h2 id="WGMMA-的同步"><a href="#WGMMA-的同步" class="headerlink" title="WGMMA 的同步"></a>WGMMA 的同步</h2><p>接下来，还剩下和 <code>cute::gemm</code> 相关的同步操作还没有解释。</p>
+<figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">cute::<span class="built_in">warpgroup_arrive</span>();</span><br><span class="line">cute::<span class="built_in">gemm</span>(tiled_mma, <span class="built_in">tCrA</span>(_,_,_,read_pipe), <span class="built_in">tCrB</span>(_,_,_,read_pipe), tCrC);</span><br><span class="line">cute::<span class="built_in">warpgroup_commit_batch</span>();</span><br><span class="line">cute::<span class="built_in">warpgroup_wait</span>&lt;<span class="number">0</span>&gt;();</span><br></pre></td></tr></table></figure>
+
+<p>wgmma 本质上是一个异步指令，在 hopper 架构上，异步意味着 wgmma 可以和其他操作同时进行，这使得我们必须在它、它依赖的指令、依赖它的指令之间设计一个同步机制。PTX <a target="_blank" rel="noopener" href="https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/">内存一致性模型</a>中详细描述了这个机制。如果同步机制设计不合理，可能导致编译器无法对 wgmma 指令的发射做优化，从而损失性能，甚至还可能产生难以发现的 bug 或 UB 行为。</p>
+<p>以下是 cute 中的方法和 PTX 指令的对应关系</p>
+<ul>
+<li><code>cute::warpgroup_arrive()</code> 对应 <code>wgmma.fence.sync.aligned</code></li>
+<li><code>cute::warpgroup_commit_batch()</code> 对应 <code>wgmma.commit_group.sync.aligned</code></li>
+<li><code>cute::wapgroup_wait&lt;N&gt;()</code> 对应 <code>wgmma.wait_group.sync.aligned N</code></li>
+</ul>
+<p>（注意此前我们一直用 wgmma 作为 wgmma.mma_async 的缩写，不过在本小节，为了避免引起歧义，会写出完整的名字）</p>
+<p>让我们过一遍在这份 <a target="_blank" rel="noopener" href="https://docs.nvidia.com/cuda/archive/12.3.2/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-multiply-accumulate-instructions">PTX 文档</a> 中的 WGMMA GEMM 的流程。</p>
+<ol>
+<li>把 A, B, D 矩阵加载进 registers 或 shared memory。</li>
+<li>执行以下 fence 操作：</li>
+</ol>
+<ul>
+<li><code>wgmma.fence</code> 操作表示跨 warpgroup 的 register&#x2F;shared-memory 写入已经完成。</li>
+<li><code>fence.proxy.async</code> 操作使得 generic proxy 操作对 async proxy 可见。</li>
+</ul>
+<ol start="3">
+<li>使用 <code>wgmma.mma_async</code> 发射异步 mma 指令，该操作在 async proxy 中进行。</li>
+<li>使用 <code>wgmma.commit_group</code> 创建一个 wgmma-group，并提交一个 commit 到这个 group，这个 commit 包含从上一次 commit 到这一次 commit 期间的 <code>wgmma.mma_async</code> 操作。</li>
+<li>使用 <code>wgmma.wait_group</code> 等待 <code>commit</code> 的内容完成。</li>
+<li>一旦 wgmma-group 完成，说明 wgmma.mma_async 操作都已经执行完毕了。</li>
+</ol>
+<p>接下来对以上内容逐一解释。首先，<code>wgmma.fence</code> 指令确保 <code>wgmma.mma_async</code> 指令只能在先前对特定 RMEM 地址的访问完成后，访问这些地址。</p>
+<p>如同 <a target="_blank" rel="noopener" href="https://research.colfax-intl.com/tutorial-hopper-tma/">TMA operations</a>，wgmma.mma_async 在 <a target="_blank" rel="noopener" href="https://docs.nvidia.com/cuda/parallel-thread-execution/#async-proxy">async proxy</a> 中进行。因此，如果在 generic proxy 中的操作会影响到 wgmma.mma_async 要读取的 SMEM，那么我们需要发射 <code>fence.proxy.async</code>。例如，如果我们用 <code>ld.global/st.shared</code> 进行访存，那么就需要 <code>fence.proxy.async</code>，但由于这个例子中我们用的是 TMA load，因此不需要 <code>fence.proxy.async</code>。</p>
+<p><code>wgmma.commit_group</code> 指令为每一个 warpgroup 创建了一个新的 wgmma-group，并将执行中的 warpgroup 发起的所有先前的、尚未 commit 的 <code>wgmma.mma_async</code> 指令批处理到 wgmma-group 中。在我们的例子中，<code>cute::warpgroup_commit_batch()</code> 将 <code>MMA_MxMMA_NxMMA_K</code> 个 <code>wgmma.mma_async</code> 指令批处理成一个 wgmma-group。</p>
+<p>最后，带有一个参数 <code>N</code> 的 <code>wgmma.wait_group</code> 指令将等待，直到还剩小于等于 <code>N</code> 个最近的 <code>wgmma-groups</code> 还在执行中，而除此之外先前 commit 的 wgmma-group 都执行完了。在我们的例子中，N&#x3D;0，意味着 warpgroup 仅仅会等待当前循环中 commit 的这个 wgmma-group。</p>
+<p>在 warpgroup 有机会执行独立计算的情况下，参数 N 就可以灵活地设置了。例如，<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/flashattention-3-fast-and-accurate-attention-with-asynchrony-and-low-precision/">FlashAttention-3</a> 设计中就应用了 GEMM-softmax 重叠策略。</p>
+<h2 id="WGMMA-core-matrices"><a href="#WGMMA-core-matrices" class="headerlink" title="WGMMA core matrices"></a>WGMMA core matrices</h2><p>本文的最后一小节深入讨论对 A 和 B 载入 SMEM 时对 layout 的要求（假设 wgmma 的源操作数都在 SMEM 中）。为了简化讨论，首先假设 A 和 B 都说 k-major 的。回顾前面所说，wgmma 指令的 tile shape 中的 MxNxK 要满足 M 是 64，N 是 8 到 256 中 8 的倍数，K 乘以数据类型的 size 等于 32 bytes。为了避免对 A&#x2F;B 和 sA&#x2F;sB 产生混淆，我们把 WGMMA atom 的 tile 记作 wA 和 wB。</p>
+<p>wA 和 wB 被划分为若干个小矩阵，这些小矩阵被称为 core matrices。每一个 core matrix 有一个 strided 方向和一个 contiguous 方向，要求 strided 方向的长度是 8 bytes，contiguous 方向的长度是 16bytes。wA 矩阵由 8x2 个 core matrices 构成，wB 由 2x(N&#x2F;8) 个 core matrices 构成。下面两张图分别是 wA 和 wB 在 SMEM 中的 layout：</p>
+<p><img src="/image.png" alt="wA"><br><img src="/image-1.png" alt="wB"></p>
+<p>如上面提到的那样，wgmma 在 SS 模式下要求以 matrix descriptor 作为输入，这个 descriptor 包含 5 个参数：</p>
+<ul>
+<li>开始地址：该操作数在 SMEM 中的基地址。</li>
+<li>LBO（leading dimension byte offset）：K 方向上相邻两个 core matrices 的距离（单位是 bytes）。</li>
+<li>SBO（stride dimension byte offset）：M 方向上相邻两个 core matrices 的距离（单位是 bytes）。</li>
+<li>swizzle mode：None，32bytes，64bytes，128bytes。</li>
+<li>Matrix base offset：用于解决 SMEM 的对齐问题，以免 SMEM 地址未对齐到 swizzle mode 中重重复 pattern 的 byte 边界。</li>
+</ul>
+<p>LDO 和 SBO 的概念如上面两张图所描述的那样。</p>
+<p>在 CUTLASS 中，<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/"><code>make_gmma_desc</code></a> 方法能够根据 SMEM tensor 的 layout 构造相应的 descriptor。具体地，它可以根据我们用 tile_to_shape 方法创建的 layout，自动对 LBO，SBO，swizzle 等进行计算。例如，<code>GmmaDescriptor</code> 描述了 k-major 情况下允许的 WGMMA 布局（其中 Txsizeof(dtype)&#x3D;16）：</p>
+<figure class="highlight txt"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">No swizzle       : Swizzle&amp;lt;0,4,3&gt; o smem_ptr o ((8,m),(T,2)):((1T,SBO),(1,LBO))</span><br><span class="line">32-byte swizzle  : Swizzle&amp;lt;1,4,3&gt; o smem_ptr o ((8,m),(T,2)):((2T,SBO),(1, T ))</span><br><span class="line">64-byte swizzle  : Swizzle&amp;lt;2,4,3&gt; o smem_ptr o ((8,m),(T,2)):((4T,SBO),(1, T ))</span><br><span class="line">128-byte swizzle : Swizzle&amp;lt;3,4,3&gt; o smem_ptr o ((8,m),(T,2)):((8T,SBO),(1, T ))</span><br></pre></td></tr></table></figure>
+
+<p>对于由 GMMA layout atom &#x3D;&gt; tile_to _shape 模式生成的 <a target="_blank" rel="noopener" href="https://github.com/NVIDIA/cutlass/blob/be60a0b27204078dc0f3f1d6ed4a95cdb2114111/include/cute/layout.hpp#L415">compact</a> layout，有以下对应的 LBO 和 SBO（注意，在 64byte 和 128 byte swizzle 的情况下，GMMA layout K atom 的 k mode 比 WGMMA atom 的 k mode 更大）：</p>
+<figure class="highlight txt"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">No swizzle       : LBO = 16x8 = 128 bytes. SBO = 32x8 = 256 bytes.</span><br><span class="line">32-byte swizzle  : SBO = 32x8 = 256 bytes.</span><br><span class="line">64-byte swizzle  : SBO = 64x8 = 512 bytes.</span><br><span class="line">128-byte swizzle : SBO = 128x8 = 1024 bytes.</span><br></pre></td></tr></table></figure>
+
+<p>最值得注意的是，对于 64byte 和 128 byte 的 swizzle，stride 的设置使得给定的允许的 WGMMA layout 不 compact。相反，存在一组 2 或 4 个  WGMMA atom 的输入 tile 在 K 方向上并排堆叠，从而导致 core matrices 在 M-mode 上的步长分别是 4T 和 8T。换句话说，当进行 swizzle 的时候，会在 SMEM 中交错存储在 k-mode 下逻辑上相邻的 2&#x2F;4&#x2F;8 个 core matrices，并且它们对于 64byte 和 128byte 的 swizzle 将属于不同的 WGMMA atom。</p>
+<p>这里顺便列出完整的 mn-major 的允许的 WGMMA layout：</p>
+<figure class="highlight txt"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line">No swizzle       : Swizzle&amp;lt;0,4,3&gt; o smem_ptr o ((T,1,m),(8,k)):((1,T,SBO),(1T,LBO))</span><br><span class="line">32-byte swizzle  : Swizzle&amp;lt;1,4,3&gt; o smem_ptr o ((T,2,m),(8,k)):((1,T,LBO),(2T,SBO))</span><br><span class="line">64-byte swizzle  : Swizzle&amp;lt;2,4,3&gt; o smem_ptr o ((T,4,m),(8,k)):((1,T,LBO),(4T,SBO))</span><br><span class="line">128-byte swizzle : Swizzle&amp;lt;3,4,3&gt; o smem_ptr o ((T,8,m),(8,k)):((1,T,LBO),(8T,SBO))</span><br></pre></td></tr></table></figure>
+
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p>作为 GEMM 系列的第一部分，本文讨论了 WGMMA 在 Hopper 架构上的 GEMM 中所涉及到的核心概念。</p>
+<p>WGMMA 需要一个 warpgroup，128 threads，来一起参与矩阵乘法。接着我们解释了如何构造 TiledMMA，如何构造输入矩阵 A 和 B 在 SMEM 中的 layouts 来满足 WGMMA 的约束（利用 <code>tile_to_shape</code>）。</p>
+<p>此外，WGMMA 还涉及到同步机制，这一部分我们介绍了与 <code>wgmma.mma_async</code> 相关的几个概念：<code>wgmma.fence</code>, <code>fence.proxy.async</code>, <code>wgmma.commit_group</code> 和 <code>wgmma.wait_group</code>。</p>
+<p>最后，我们解释了一些 WGMMA 的执行细节——corematrices，以及 CUTLASS 时如何构造 matrix descriptors 的。</p>
+<p>总的来说，这篇 blog 旨在能够让大家搞懂在 Hopper 架构上 CUTLASS kernel 中是如何使用 WGMMA 的。在下一篇 blog 中，我们会将讨论 TMA，以及 TMA 和 WGMMA 是如何在 Hopper 架构上协同工作的。</p>
 
       
     </div>
@@ -229,10 +417,16 @@
                 <i class="far fa-calendar"></i>
               </span>
               <span class="post-meta-item-text">Posted on</span>
-              
 
-              <time title="Created: 2024-12-21 14:50:45 / Modified: 15:44:06" itemprop="dateCreated datePublished" datetime="2024-12-21T14:50:45+08:00">2024-12-21</time>
+              <time title="Created: 2024-12-21 14:50:45" itemprop="dateCreated datePublished" datetime="2024-12-21T14:50:45+08:00">2024-12-21</time>
             </span>
+              <span class="post-meta-item">
+                <span class="post-meta-item-icon">
+                  <i class="far fa-calendar-check"></i>
+                </span>
+                <span class="post-meta-item-text">Edited on</span>
+                <time title="Modified: 2025-03-06 16:08:22" itemprop="dateModified" datetime="2025-03-06T16:08:22+08:00">2025-03-06</time>
+              </span>
 
           
 
@@ -248,7 +442,7 @@
           <h1 id="关于这个博客"><a href="#关于这个博客" class="headerlink" title="关于这个博客"></a>关于这个博客</h1><blockquote>
 <p>这里是我的个人博客网站。</p>
 </blockquote>
-<p>邮箱：<a href="mailto:&#x79;&#105;&#x6e;&#x67;&#x6c;&#117;&#x6f;&#x73;&#97;&#110;&#113;&#105;&#97;&#110;&#x40;&#103;&#x6d;&#x61;&#x69;&#x6c;&#x2e;&#99;&#111;&#x6d;">&#x79;&#105;&#x6e;&#x67;&#x6c;&#117;&#x6f;&#x73;&#97;&#110;&#113;&#105;&#97;&#110;&#x40;&#103;&#x6d;&#x61;&#x69;&#x6c;&#x2e;&#99;&#111;&#x6d;</a></p>
+<p>邮箱：<a href="mailto:&#121;&#105;&#x6e;&#103;&#108;&#x75;&#x6f;&#115;&#97;&#110;&#113;&#x69;&#97;&#x6e;&#64;&#x67;&#x6d;&#97;&#x69;&#x6c;&#x2e;&#x63;&#111;&#109;">&#121;&#105;&#x6e;&#103;&#108;&#x75;&#x6f;&#115;&#97;&#110;&#113;&#x69;&#97;&#x6e;&#64;&#x67;&#x6d;&#97;&#x69;&#x6c;&#x2e;&#x63;&#111;&#109;</a></p>
 
       
     </div>
@@ -333,6 +527,10 @@
           <span class="site-state-item-count">2</span>
           <span class="site-state-item-name">posts</span>
         </a>
+      </div>
+      <div class="site-state-item site-state-tags">
+        <span class="site-state-item-count">1</span>
+        <span class="site-state-item-name">tags</span>
       </div>
   </nav>
 </div>
