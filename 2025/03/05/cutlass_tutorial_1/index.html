@@ -20,22 +20,22 @@
     var CONFIG = {"hostname":"example.com","root":"/","scheme":"Muse","version":"7.8.0","exturl":false,"sidebar":{"position":"left","display":"post","padding":18,"offset":12,"onmobile":false},"copycode":{"enable":false,"show_result":false,"style":null},"back2top":{"enable":true,"sidebar":false,"scrollpercent":false},"bookmark":{"enable":false,"color":"#222","save":"auto"},"fancybox":false,"mediumzoom":false,"lazyload":false,"pangu":false,"comments":{"style":"tabs","active":null,"storage":true,"lazyload":false,"nav":null},"algolia":{"hits":{"per_page":10},"labels":{"input_placeholder":"Search for Posts","hits_empty":"We didn't find any results for the search: ${query}","hits_stats":"${hits} results found in ${time} ms"}},"localsearch":{"enable":false,"trigger":"auto","top_n_per_article":1,"unescape":false,"preload":false},"motion":{"enable":true,"async":false,"transition":{"post_block":"fadeIn","post_header":"slideDownIn","post_body":"slideDownIn","coll_header":"slideLeftIn","sidebar":"slideUpIn"}}};
   </script>
 
-  <meta name="description" content="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法 写在前面：本文翻译自（https:&#x2F;&#x2F;research.colfax-intl.com&#x2F;cutlass-tutorial-wgmma-hopper&#x2F;），有些内容比较复杂没有翻译好还请见谅。  一个完整的 CUDA 教程系列无法绕过 GEMM（GEneral Matrix Multiplication，通用">
+  <meta name="description" content="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法 写在前面：本文翻译自这里，有些内容比较复杂没有翻译好还请见谅。  一个完整的 CUDA 教程系列无法绕过 GEMM（GEneral Matrix Multiplication，通用矩阵乘法）。GEMM 或许是现代 GPU 上最重要的程序了，因为它是神经网络、大语言模型、许多图形应用中的主要计算内容。尽管">
 <meta property="og:type" content="article">
 <meta property="og:title" content="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法">
 <meta property="og:url" content="http://example.com/2025/03/05/cutlass_tutorial_1/index.html">
 <meta property="og:site_name" content="yingluosanqian">
-<meta property="og:description" content="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法 写在前面：本文翻译自（https:&#x2F;&#x2F;research.colfax-intl.com&#x2F;cutlass-tutorial-wgmma-hopper&#x2F;），有些内容比较复杂没有翻译好还请见谅。  一个完整的 CUDA 教程系列无法绕过 GEMM（GEneral Matrix Multiplication，通用">
+<meta property="og:description" content="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法 写在前面：本文翻译自这里，有些内容比较复杂没有翻译好还请见谅。  一个完整的 CUDA 教程系列无法绕过 GEMM（GEneral Matrix Multiplication，通用矩阵乘法）。GEMM 或许是现代 GPU 上最重要的程序了，因为它是神经网络、大语言模型、许多图形应用中的主要计算内容。尽管">
 <meta property="og:locale" content="en_US">
-<meta property="og:image" content="http://example.com/images/ptx_inst.png">
-<meta property="og:image" content="http://example.com/image.png">
-<meta property="og:image" content="http://example.com/image-1.png">
+<meta property="og:image" content="http://example.com/images/cutlass_tutorial_1/ptx_inst.png">
+<meta property="og:image" content="http://example.com/images/cutlass_tutorial_1/image.png">
+<meta property="og:image" content="http://example.com/images/cutlass_tutorial_1/image-1.png">
 <meta property="article:published_time" content="2025-03-05T07:34:03.320Z">
-<meta property="article:modified_time" content="2025-03-07T06:15:13.336Z">
+<meta property="article:modified_time" content="2025-03-07T06:19:04.077Z">
 <meta property="article:author" content="yingluosanqian">
 <meta property="article:tag" content="CUTLASS, GPU, CUDA, Hopper, WGMMA">
 <meta name="twitter:card" content="summary">
-<meta name="twitter:image" content="http://example.com/images/ptx_inst.png">
+<meta name="twitter:image" content="http://example.com/images/cutlass_tutorial_1/ptx_inst.png">
 
 <link rel="canonical" href="http://example.com/2025/03/05/cutlass_tutorial_1/">
 
@@ -185,7 +185,7 @@
                   <i class="far fa-calendar-check"></i>
                 </span>
                 <span class="post-meta-item-text">Edited on</span>
-                <time title="Modified: 2025-03-07 14:15:13" itemprop="dateModified" datetime="2025-03-07T14:15:13+08:00">2025-03-07</time>
+                <time title="Modified: 2025-03-07 14:19:04" itemprop="dateModified" datetime="2025-03-07T14:19:04+08:00">2025-03-07</time>
               </span>
 
           
@@ -200,7 +200,7 @@
 
       
         <h1 id="【翻译】CUTLASS-教程（1）：用-WGMMA-在-Hopper-架构上实现高效矩阵乘法"><a href="#【翻译】CUTLASS-教程（1）：用-WGMMA-在-Hopper-架构上实现高效矩阵乘法" class="headerlink" title="【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法"></a>【翻译】CUTLASS 教程（1）：用 WGMMA 在 Hopper 架构上实现高效矩阵乘法</h1><blockquote>
-<p>写在前面：本文翻译自（<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/%EF%BC%89%EF%BC%8C%E6%9C%89%E4%BA%9B%E5%86%85%E5%AE%B9%E6%AF%94%E8%BE%83%E5%A4%8D%E6%9D%82%E6%B2%A1%E6%9C%89%E7%BF%BB%E8%AF%91%E5%A5%BD%E8%BF%98%E8%AF%B7%E8%A7%81%E8%B0%85%E3%80%82">https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/），有些内容比较复杂没有翻译好还请见谅。</a></p>
+<p>写在前面：本文翻译自<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/">这里</a>，有些内容比较复杂没有翻译好还请见谅。</p>
 </blockquote>
 <p>一个完整的 CUDA 教程系列无法绕过 GEMM（GEneral Matrix Multiplication，通用矩阵乘法）。GEMM 或许是现代 GPU 上最重要的程序了，因为它是神经网络、大语言模型、许多图形应用中的主要计算内容。尽管 GEMM 无处不在，然而众所周知实现一个高效的 GEMM 是很困难的。</p>
 <p>这个教程三部曲旨在为读者建立一个关于“如何在 Hopper 架构的 GPU 上使用 CUTLASS 写出高效的 GEMM”的大致概念。</p>
@@ -315,7 +315,7 @@
 
 <p>这里的 tCgC 是输出 GMEM tensor 在该线程中的切片，tCrC 则是计算结果，将要被写入 tCgC。tCrC 的 layout 具体有格式 <code>(MMA, MMA_M, MMA_N)</code>，可以认为是在 MxN&#x3D;64x64 的 MMA Atom 中，这 128 threads 中的每一个 thread 都持有 2x2x8&#x3D;32 个元素，这里的 MMA_M 和 MMA_N 分别于 tCsA 和 tCsB 中的值相等。</p>
 <p>每一个线程持有的一个 atom 中的 32 个元素，注意它的 shape 是要和 tCgC 是对上的。具体的划分是由具体的 wgmma 指令规定的，可以在下图检索具体的信息（来自<a target="_blank" rel="noopener" href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#wgmma-64n16-d">PTX文档</a>）：</p>
-<p><img src="/../images/ptx_inst.png" alt="alt text"></p>
+<p><img src="/../images/cutlass_tutorial_1/ptx_inst.png" alt="alt text"></p>
 <p>上图阐明了一个线程拿着的 32 个元素呈现一个 Z 字形。例如，thread 0 拿着在 <code>(0,0),(0,1),(8,0),(8,1)</code> 这些元素，并且这样的 pattern 在列方向上重复了 8 次。</p>
 <h2 id="cute-gemm-调用"><a href="#cute-gemm-调用" class="headerlink" title="cute::gemm() 调用"></a>cute::gemm() 调用</h2><p>让我们回到 kernel 代码的第 25 行：</p>
 <figure class="highlight c++"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">// (V,M,K) x (V,N,K) =&gt; (V,M,N)</span></span><br><span class="line">cute::<span class="built_in">gemm</span>(tiled_mma, <span class="built_in">tCrA</span>(_,_,_,read_pipe), <span class="built_in">tCrB</span>(_,_,_,read_pipe), tCrC);</span><br></pre></td></tr></table></figure>
@@ -359,7 +359,7 @@
 <p>在 warpgroup 有机会执行独立计算的情况下，参数 N 就可以灵活地设置了。例如，<a target="_blank" rel="noopener" href="https://research.colfax-intl.com/flashattention-3-fast-and-accurate-attention-with-asynchrony-and-low-precision/">FlashAttention-3</a> 设计中就应用了 GEMM-softmax 重叠策略。</p>
 <h2 id="WGMMA-core-matrices"><a href="#WGMMA-core-matrices" class="headerlink" title="WGMMA core matrices"></a>WGMMA core matrices</h2><p>本文的最后一小节深入讨论对 A 和 B 载入 SMEM 时对 layout 的要求（假设 wgmma 的源操作数都在 SMEM 中）。为了简化讨论，首先假设 A 和 B 都说 k-major 的。回顾前面所说，wgmma 指令的 tile shape 中的 MxNxK 要满足 M 是 64，N 是 8 到 256 中 8 的倍数，K 乘以数据类型的 size 等于 32 bytes。为了避免对 A&#x2F;B 和 sA&#x2F;sB 产生混淆，我们把 WGMMA atom 的 tile 记作 wA 和 wB。</p>
 <p>wA 和 wB 被划分为若干个小矩阵，这些小矩阵被称为 core matrices。每一个 core matrix 有一个 strided 方向和一个 contiguous 方向，要求 strided 方向的长度是 8 bytes，contiguous 方向的长度是 16bytes。wA 矩阵由 8x2 个 core matrices 构成，wB 由 2x(N&#x2F;8) 个 core matrices 构成。下面两张图分别是 wA 和 wB 在 SMEM 中的 layout：</p>
-<p><img src="/image.png" alt="wA"><br><img src="/image-1.png" alt="wB"></p>
+<p><img src="/../images/cutlass_tutorial_1/image.png" alt="wA"><br><img src="/../images/cutlass_tutorial_1/image-1.png" alt="wB"></p>
 <p>如上面提到的那样，wgmma 在 SS 模式下要求以 matrix descriptor 作为输入，这个 descriptor 包含 5 个参数：</p>
 <ul>
 <li>开始地址：该操作数在 SMEM 中的基地址。</li>
